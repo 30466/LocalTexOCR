@@ -223,17 +223,122 @@ def detect_layout(img: Image.Image) -> list[dict]:
         bbox = [round(c) for c in box.tolist()]  # [x1, y1, x2, y2] in pixels
         regions.append({"label": label, "bbox": bbox, "score": round(score.item(), 3)})
 
-    # Sort by reading order: top-to-bottom, then left-to-right
-    regions.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
+    # Sort by column-aware reading order
+    regions = _sort_by_columns(regions, img.size[0])
 
     logger.info(f"[layout] Detected {len(regions)} regions")
     return regions
+
+
+def _detect_columns(regions: list[dict], img_width: int) -> list[list[dict]]:
+    """Detect multi-column layout by clustering region x-centers.
+    Returns list of columns (each a list of regions), left-to-right.
+    Full-width regions (spanning >60% of image width) are NOT assigned to columns;
+    they are returned as a special first "column" to be placed before columnar content.
+    """
+    if not regions:
+        return []
+
+    FULL_WIDTH_RATIO = 0.6  # regions wider than this fraction are "full-width"
+    # Labels that are always treated as full-width (headers, titles)
+    FULL_WIDTH_LABELS = {"doc_title", "paragraph_title", "title", "section_title"}
+    full_width = []
+    narrow = []
+
+    for r in regions:
+        x1, _, x2, _ = r["bbox"]
+        width = x2 - x1
+        if width > img_width * FULL_WIDTH_RATIO or r["label"] in FULL_WIDTH_LABELS:
+            full_width.append(r)
+        else:
+            narrow.append(r)
+
+    if not narrow:
+        return [full_width] if full_width else []
+
+    # Cluster narrow regions into columns by x-center
+    centers = [(r["bbox"][0] + r["bbox"][2]) / 2 for r in narrow]
+    columns = _cluster_columns(narrow, centers, img_width)
+
+    # Sort columns left-to-right by average x-center
+    columns.sort(key=lambda col: sum((r["bbox"][0] + r["bbox"][2]) / 2 for r in col) / len(col))
+
+    # Sort regions within each column top-to-bottom
+    for col in columns:
+        col.sort(key=lambda r: r["bbox"][1])
+
+    # Tag each region with its column index for merge grouping
+    if full_width:
+        full_width.sort(key=lambda r: r["bbox"][1])
+        for r in full_width:
+            r["_column"] = 0
+
+    for ci, col in enumerate(columns):
+        for r in col:
+            r["_column"] = ci + (1 if full_width else 0)
+
+    result = []
+    if full_width:
+        result.append(full_width)
+    result.extend(columns)
+    return result
+
+
+def _cluster_columns(regions: list[dict], centers: list[float], img_width: int) -> list[list[dict]]:
+    """Simple 1D clustering of regions into columns by x-center.
+    Uses a gap threshold: if the gap between sorted x-centers exceeds
+    a fraction of the image width, start a new column.
+    """
+    GAP_RATIO = 0.15  # minimum gap between columns as fraction of image width
+    gap_threshold = img_width * GAP_RATIO
+
+    indexed = sorted(enumerate(regions), key=lambda t: centers[t[0]])
+    columns: list[list[dict]] = []
+    current_col: list[dict] = [indexed[0][1]]
+    prev_center = centers[indexed[0][0]]
+
+    for idx, region in indexed[1:]:
+        c = centers[idx]
+        if c - prev_center > gap_threshold:
+            columns.append(current_col)
+            current_col = [region]
+        else:
+            current_col.append(region)
+        prev_center = c
+
+    columns.append(current_col)
+    return columns
+
+
+def _sort_by_columns(regions: list[dict], img_width: int) -> list[dict]:
+    """Sort regions by column-aware reading order.
+    For single-column docs: top-to-bottom.
+    For multi-column docs: full-width first, then left col top-to-bottom, right col top-to-bottom.
+    """
+    columns = _detect_columns(regions, img_width)
+
+    if len(columns) <= 1:
+        # Single column or all full-width: simple top-to-bottom
+        regions.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
+        return regions
+
+    # Multi-column: interleave full-width regions by y-position among columns
+    # Full-width regions (columns[0] if wider) come before each column section
+    # that starts below them
+    sorted_regions = []
+    for col in columns:
+        sorted_regions.extend(col)
+
+    logger.info(f"[layout] Detected {len(columns)} columns "
+                f"({', '.join(str(len(c)) + ' regions' for c in columns)})")
+    return sorted_regions
 
 
 def _merge_adjacent_regions(raw_regions: list[dict]) -> list[list[dict]]:
     """Group adjacent non-solo regions into merge groups.
     Returns list of groups, where each group is a list of raw regions.
     Solo regions (table, figure) always form their own group.
+    Column boundaries (tagged by _detect_columns) split groups.
     """
     groups: list[list[dict]] = []
     current: list[dict] = []
@@ -245,6 +350,10 @@ def _merge_adjacent_regions(raw_regions: list[dict]) -> list[list[dict]]:
                 current = []
             groups.append([region])
         else:
+            # Split at column boundaries (different _column tag)
+            if current and current[-1].get("_column") != region.get("_column"):
+                groups.append(current)
+                current = []
             current.append(region)
 
     if current:
