@@ -248,15 +248,19 @@ def _detect_columns(regions: list[dict], img_width: int) -> list[list[dict]]:
     img_center = img_width / 2
     CENTER_TOLERANCE = 0.15  # region center within 15% of image center = "centered"
 
+    MAX_SUBTITLE_HEIGHT = 50  # centered regions taller than this are text blocks, not subtitles
+
     for r in regions:
-        x1, _, x2, _ = r["bbox"]
+        x1, y1, x2, y2 = r["bbox"]
         width = x2 - x1
+        height = y2 - y1
         cx = (x1 + x2) / 2
         is_centered = abs(cx - img_center) < img_width * CENTER_TOLERANCE
+        is_single_line = height <= MAX_SUBTITLE_HEIGHT
 
         if (width > img_width * FULL_WIDTH_RATIO
                 or r["label"] in FULL_WIDTH_LABELS
-                or (is_centered and width < img_width * 0.45)):
+                or (is_centered and width < img_width * 0.45 and is_single_line)):
             full_width.append(r)
         else:
             narrow.append(r)
