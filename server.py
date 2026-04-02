@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger.info(f"=== Server starting, log file: {LOG_FILE} ===")
 
-app = FastAPI(title="Folio-OCR Service", version="3.1.0")
+app = FastAPI(title="Folio-OCR Service", version="3.2.0")
 
 # CORS
 app.add_middleware(
