@@ -435,8 +435,18 @@ async def ocr_image_with_layout(image_path: str, merge: bool = True) -> tuple[st
         groups = _merge_adjacent_regions(raw_regions)
         logger.info(f"[OCR] Merged {len(raw_regions)} regions into {len(groups)} groups")
 
+        # Find the bottom edge of full-width regions (column 0) to extend column crops upward.
+        # This catches text that the layout model missed between headers and column content.
+        fullwidth_bottom = 0
+        for r in raw_regions:
+            if r.get("_column") == 0:
+                fullwidth_bottom = max(fullwidth_bottom, r["bbox"][3])
+
         for gi, group in enumerate(groups):
             bbox = _group_bbox(group)
+            # Extend column groups upward to fullwidth_bottom to cover undetected gaps
+            if group[0].get("_column", 0) > 0 and fullwidth_bottom > 0:
+                bbox[1] = min(bbox[1], fullwidth_bottom)
             cropped = img.crop(bbox)
             seg_b64 = _image_to_b64(cropped)
             text = await _ocr_single(seg_b64)
