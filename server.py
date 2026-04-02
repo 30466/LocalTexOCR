@@ -245,10 +245,18 @@ def _detect_columns(regions: list[dict], img_width: int) -> list[list[dict]]:
     full_width = []
     narrow = []
 
+    img_center = img_width / 2
+    CENTER_TOLERANCE = 0.15  # region center within 15% of image center = "centered"
+
     for r in regions:
         x1, _, x2, _ = r["bbox"]
         width = x2 - x1
-        if width > img_width * FULL_WIDTH_RATIO or r["label"] in FULL_WIDTH_LABELS:
+        cx = (x1 + x2) / 2
+        is_centered = abs(cx - img_center) < img_width * CENTER_TOLERANCE
+
+        if (width > img_width * FULL_WIDTH_RATIO
+                or r["label"] in FULL_WIDTH_LABELS
+                or (is_centered and width < img_width * 0.45)):
             full_width.append(r)
         else:
             narrow.append(r)
