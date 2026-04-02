@@ -527,16 +527,57 @@ def _latex_to_unicode(text: str) -> str:
 
     text = re.sub(r'\$\\frac\{([^}]+)\}\{([^}]+)\}\$', _replace_frac, text)
 
-    # 3. Simple $\command$ → Unicode (longest match first)
+    # 3. Inline math $...$ and display math $$...$$ → convert interior then strip delimiters
+    text = re.sub(r'\$\$(.+?)\$\$', lambda m: _convert_math_interior(m.group(1)), text, flags=re.DOTALL)
+    text = re.sub(r'\$(.+?)\$', lambda m: _convert_math_interior(m.group(1)), text)
+
+    # 4. Simple $\command$ → Unicode (longest match first) — catch any remaining
     for latex_cmd, unicode_char in _LATEX_SIMPLE:
         token = f"${latex_cmd}$"
         if token in text:
             text = text.replace(token, unicode_char)
 
-    # 4. Remaining bare $\command$ patterns not in map — unwrap the $ delimiters
+    # 5. Remaining bare $\command$ patterns not in map — unwrap the $ delimiters
     text = re.sub(r'\$\\([a-zA-Z]+)\$', lambda m: '\\' + m.group(1), text)
 
     return text
+
+
+def _convert_math_interior(math: str) -> str:
+    """Convert LaTeX math content to Unicode plain text.
+    Handles: ^{\\circ} → °, \\sim → ~, \\times → ×, etc.
+    Collapses spurious spaces between digits: '1 5' → '15'.
+    """
+    s = math.strip()
+
+    # ^{\circ} or ^\circ → ° (degree symbol)
+    s = re.sub(r'\^\{\\circ\}', '°', s)
+    s = re.sub(r'\^\\circ', '°', s)
+
+    # ^{...} superscript — for single char/digit, use Unicode superscript if possible
+    # For complex content, just append it
+    s = re.sub(r'\^\{([^}]+)\}', lambda m: m.group(1), s)
+    s = re.sub(r'\^(\d)', lambda m: m.group(1), s)
+
+    # _{...} subscript — similar treatment
+    s = re.sub(r'_\{([^}]+)\}', lambda m: m.group(1), s)
+    s = re.sub(r'_(\d)', lambda m: m.group(1), s)
+
+    # Replace LaTeX commands with Unicode (longest match first)
+    for latex_cmd, unicode_char in _LATEX_SIMPLE:
+        if latex_cmd in s:
+            s = s.replace(latex_cmd, unicode_char)
+
+    # Remove remaining braces
+    s = s.replace('{', '').replace('}', '')
+
+    # Collapse spaces between digits: "1 5" → "15", "2 0" → "20"
+    s = re.sub(r'(\d)\s+(\d)', r'\1\2', s)
+
+    # Clean up multiple spaces
+    s = re.sub(r' {2,}', ' ', s)
+
+    return s.strip()
 
 
 def pdf_to_images(pdf_path: str, output_dir: Path) -> list[str]:
