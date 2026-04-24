@@ -1,154 +1,89 @@
-# Folio-OCR
+# LocalTexOCR
 
-基于 [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) + [Ollama](https://ollama.com/) 的三栏文档 OCR 工作台，专为书籍和文档的日常批量识别设计。
+一个专为 **LaTeX 公式识别与格式化** 设计的本地轻量级工作台。
 
-![架构](https://img.shields.io/badge/Backend-FastAPI-009688?style=flat-square) ![前端](https://img.shields.io/badge/Frontend-Vanilla_JS-F7DF1E?style=flat-square) ![数据库](https://img.shields.io/badge/DB-SQLite-003B57?style=flat-square) [![主页](https://img.shields.io/badge/Homepage-GitHub%20Pages-D4A373?style=flat-square)](https://vorojar.github.io/Folio-OCR/)
+本项目基于 [Folio-OCR](https://github.com/vorojar/Folio-OCR) 进行二次开发与精简，去除了复杂的排版分析和 DOCX 导出，专注于将手写或印刷的数学公式、定理、习题快速转化为规范的 LaTeX 代码。
 
-![Folio-OCR 界面截图](demo.png)
-
-## 功能特性
-
-### OCR 核心
-- 支持多种图片格式：PNG、JPG、GIF、BMP
-- 支持 PDF 文件（PyMuPDF 2x 高分辨率拆页）
-- 多文件混合上传（图片 + PDF 混选）
-- 版面分析（Layout Detection）自动分区识别
-- 相邻文本区域智能合并，减少 OCR 调用次数（11 区域 → 3 组，2.5x 加速）
-- LaTeX 特殊字符自动转 Unicode（`$\textcircled{1}$` → `①`）
-- 模型输出自动清理 ` ```markdown ``` ` 围栏
-
-### 批量处理
-- 一键「OCR All Pages」批量识别全部页面
-- 实时进度条 + ETA 时间估算
-- 随时可停（Stop 按钮立即中断当前请求）
-- 选中页面时自动预识别下一页（Pre-OCR）
-
-### 编辑与导出
-- Edit / Preview 双模式切换
-- Preview 模式原生渲染 HTML 表格和 Markdown
-- 段落重排（Reflow）：合并因换行断开的段落
-- 导出三种格式：`.md`（Markdown）、`.txt`（纯文本）、`.docx`（Word）
-- DOCX 导出基于 python-docx，真实 Word 文档，含分节符和页码
-- 单页/全文一键复制
-
-### 数据持久化
-- SQLite 数据库（`folio_ocr.db`），文档和 OCR 结果服务重启不丢失
-- 编辑内容 800ms 防抖自动保存
-- 页面加载时自动恢复上次打开的文档
-- 多文档管理：左侧面板上方文档列表，支持切换和删除
-
-### 界面交互
-- 三栏布局：页面缩略图 | 图片预览 | OCR 结果
-- 右侧面板可拖拽调整宽度
-- SSE 流式上传，逐页实时加载
-- 版面区域双向高亮（点击图片框 ↔ 点击文本块）
-- 全文搜索（Ctrl+F），跨页高亮 + 命中计数
-- 键盘导航（↑↓ 切换页面）
-- 暖色奶油/炭灰主题，中文字体适配
-
-### 网络容错
-- 所有网络请求带超时保护（按场景分档：5s ~ 180s）
-- Toast 弹窗通知：保存失败、OCR 超时、加载错误等即时反馈
-- Ollama 断开后 UI 不会冻住，超时后自动恢复可操作状态
-
-## 快速开始（Docker 一键部署）
-
-只需装好 [Docker](https://docs.docker.com/get-docker/)，三条命令搞定：
-
-```bash
-# 1. 克隆项目
-git clone https://github.com/vorojar/Folio-OCR.git
-cd Folio-OCR
-
-# 2. 启动服务（首次会自动构建镜像，需要几分钟）
-docker compose up -d
-
-# 3. 下载 OCR 模型（约 2GB，只需执行一次）
-docker compose exec ollama ollama pull glm-ocr
-```
-
-完成后打开浏览器访问 **http://localhost:3000** 即可使用。
-
-> **有 NVIDIA 显卡？** 编辑 `docker-compose.yml`，取消 `deploy:` 段落的注释即可启用 GPU 加速。
-
-常用 Docker 命令：
-
-```bash
-docker compose down          # 停止服务
-docker compose up -d         # 重新启动（数据不会丢失）
-docker compose logs -f app   # 查看应用日志
-docker compose logs -f ollama # 查看 Ollama 日志
-```
+![LocalTexOCR 界面截图](demo.png)
 
 ---
 
-## 本地部署（不用 Docker）
+## 💡 背景与说明
 
-### 环境要求
+### 溯源
+本项目 fork 自 [Folio-OCR](https://github.com/vorojar/Folio-OCR)（原作者：vorojar）。原项目是一个功能强大的三栏文档 OCR 工作台，支持版面分析、多格式导出以及基于 GLM-OCR 的通用识别。
 
-- Python 3.10+
-- [Ollama](https://ollama.com/) 已安装且 `ollama` 在 PATH 中
+### 为什么选择 LocalTexOCR？
+与原项目相比，`LocalTexOCR` 更加“垂直”：
+- **专注 LaTeX**：内置了针对数学公式和学术正文优化的提示词（Prompts）。
+- **流程精简**：去掉了原版中对本场景不必要的“版面分析（Layout Detection）”，直接进行全页或选区的公式提取。
+- **实时预览**：整合了 KaTeX 渲染引擎，OCR 识别出的 LaTeX 代码可以立即在右侧面板看到数学公式渲染效果，方便比对修正。
+- **本地化隐私**：所有模型均运行在本地的 Ollama 容器/服务中，数据完全不出户。
 
-### 安装和启动
+---
 
+## 🛠️ 技术架构
+
+- **核心后端**: [FastAPI](https://fastapi.tiangolo.com/) (Python 3.10+)
+- **OCR 引擎**: [Ollama](https://ollama.com/) 驱动的 `glm-ocr` 模型。
+- **格式化引擎**: [Ollama](https://ollama.com/) 驱动的 `qwen2.5-coder` 模型（负责将 raw OCR 文本整理成规范的 LaTeX 结构，如 `equation` 环境、定理环境等）。
+- **前端交互**: Vanilla JS + CSS (支持双栏对比、实时 KaTeX 渲染)。
+- **数据库**: SQLite (保存文档轨迹与编辑历史)。
+
+---
+
+## 🚀 关于性能与显卡加速 (GPU)
+
+很多用户关心识别速度是否可以更快，是否需要“选择显卡”。
+
+### 核心结论
+**本项目无需在代码中手动选择显卡。** 所有的显卡调用逻辑由 **Ollama** 后端自动接管：
+
+1.  **NVIDIA (N卡)**: 只要你安装了支持 CUDA 的驱动，Ollama 在加载 `glm-ocr` 或 `qwen2.5-coder` 时会自动优先使用 GPU。
+2.  **Mac (Apple Silicon)**: 在 M1/M2/M3/M5 系列芯片上，Ollama 会自动调用 **Metal (MPS)** 加速，速度非常快。
+3.  **速度差异**: 
+    - 使用 GPU 加速时，单页公式识别通常在 **0.5s - 2s** 左右。
+    - 纯 CPU 模式下，速度可能会慢 5-10 倍，且系统风扇会狂转。
+
+### 如何确认是否启用了加速？
+- **Windows**: 识别时打开任务管理器，观察显卡的 `Dedicated GPU Memory` 或 `Compute` 占用。
+- **Mac**: 识别时打开“活动监视器”，观察 `ollama` 进程的 GPU 使用率（% GPU）。
+
+---
+
+## 📥 快速开始
+
+### 1. 环境准备
+- 安装 [Ollama](https://ollama.com/)。
+- 下载所需模型（在终端/命令行执行）：
+  ```bash
+  ollama pull glm-ocr:latest
+  ollama pull qwen2.5-coder:3b
+  ```
+
+### 2. 启动服务
+你可以直接运行预配置好的批处理脚本（Windows）：
 ```bash
-# 安装依赖
+run_workbench.bat
+```
+或者手动启动：
+```bash
 pip install -r requirements.txt
-
-# 拉取模型
-ollama pull glm-ocr
-
-# 启动服务
 python server.py
-
-# 或使用热重载开发
-uvicorn server:app --reload --host 0.0.0.0 --port 3000
-
-# Windows 一键启动
-start.bat
 ```
+然后访问 `http://localhost:3000`。
 
-服务启动后访问：http://localhost:3000
+---
 
-## 项目结构
+## 📝 常见问题 (FAQ)
 
-```
-glmocr/
-├── server.py            # FastAPI 后端（单文件）
-├── index.html           # HTML 页面
-├── script.js            # 前端逻辑
-├── style.css            # 样式
-├── latex_unicode.json   # LaTeX → Unicode 映射表
-├── requirements.txt     # Python 依赖
-├── Dockerfile           # Docker 镜像构建
-├── docker-compose.yml   # Docker Compose 编排
-├── .dockerignore        # Docker 构建排除列表
-├── start.bat            # Windows 启动脚本
-├── folio_ocr.db         # SQLite 数据库（运行时生成）
-└── uploads/             # 上传文件目录（运行时生成）
-```
+**Q: 那个 “Code Model” (qwen2.5-coder) 是干什么的？**
+A: `glm-ocr` 负责“看图识字”，但它输出的格式有时比较随意。`Code Model` 的作用像是一个“排版员”，它会根据预设的 LaTeX 铁律，将识别出来的散乱文本整理成标准的 `.tex` 源代码格式（例如自动包裹 `equation` 环境、处理定理环境等）。
 
-## API 端点
+**Q: 我发现加载很慢？**
+A: 第一次运行时 Ollama 需要将约 2GB-4GB 的模型加载到显存/内存中（冷启动），这通常需要 10-30 秒。后续的连续识别会非常迅速。
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/status` | 服务状态、Ollama 连通性 |
-| POST | `/api/load-model` | 启动 Ollama 并预热模型 |
-| POST | `/api/upload` | 上传文件，返回 SSE 页面流 |
-| GET | `/api/images/{doc_id}/{filename}` | 获取页面图片 |
-| POST | `/api/ocr/{doc_id}/{page_num}` | 单页 OCR |
-| POST | `/api/export/{doc_id}` | 导出 DOCX |
-| GET | `/api/documents` | 列出所有文档 |
-| GET | `/api/documents/{doc_id}` | 获取文档详情（含所有页面） |
-| DELETE | `/api/documents/{doc_id}` | 删除文档 |
-| PUT | `/api/pages/{doc_id}/{page_num}/text` | 保存编辑后的文本 |
-
-## 性能参考
-
-- 模型冷启动首次请求：~50s
-- 后续单页识别：~0.5s
-- PDF 以 2x 缩放矩阵渲染，保证 OCR 质量
+---
 
 ## License
-
-MIT
+[MIT](LICENSE) | 基于 [Folio-OCR](https://github.com/vorojar/Folio-OCR) 修改。

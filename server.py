@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Folio-OCR Server - Ollama Backend
-Three-column document workbench
+LocalTexOCR Server - Ollama Backend
+Handwritten LaTeX OCR + Code LLM formatting workbench
 """
 import os
 import uuid
@@ -22,19 +22,59 @@ from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import re
-from html.parser import HTMLParser
 from urllib.parse import quote
-import fitz  # PyMuPDF for PDF processing
+import fitz  # PyMuPDF
 from PIL import Image
 import io
 from pydantic import BaseModel
-from docx import Document as DocxDocument
-from docx.shared import Pt, RGBColor
-from docx.oxml.ns import qn
-from docx.enum.section import WD_SECTION_START
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-# Setup logging
+# --- Config ---
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+OLLAMA_BASE  = os.environ.get("OLLAMA_BASE",  "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "glm-ocr:latest")
+CODE_MODEL   = os.environ.get("CODE_MODEL",   "qwen2.5-coder:3b")
+
+DEFAULT_OCR_PROMPT = (
+    "精准识别图片中所有文字与数学公式。"
+    "普通文字原样输出；行内公式用 $...$ 包裹；独立居中公式用 $$...$$ 包裹。"
+    "只输出识别结果，不添加任何解释或多余内容。"
+)
+
+DEFAULT_FORMAT_PROMPT = r"""你是专业LaTeX纯格式化工具，仅对上面OCR结果内容做格式整理，严格执行以下所有规则，禁止任何变通：
+
+以下是简化版LaTeX导言区，**仅作为语法、环境、宏包参考，绝对不输出导言区的任何代码**！！！
+=====================================================================================
+【简化核心参考导言（仅用于理解语法，禁止输出）】
+\documentclass[12pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\newcommand{\diff}{\mathop{}\!\mathrm{d}}
+\newcommand{\R}{\mathbb{R}}
+\theoremstyle{plain}
+\newtheorem{theorem}{定理}[section]
+\newtheorem{definition}{定义}[section]
+\newtheorem{lemma}{引理}[theorem]
+\newtheorem{corollary}{推论}[theorem]
+=====================================================================================
+
+【核心格式化铁律（必须严格执行，无任何例外）】
+1. 输出限制：**只输出纯正文格式化后的LaTeX代码**，禁止输出导言、document环境、注释、解释、多余内容；
+2. 公式智能分类（最关键）：
+• 【重要独立公式】核心数学公式 → 用 \begin{equation} 公式 \end{equation} 单独成行，**禁止自动添加任何\label标签**；
+• 【行内公式】普通/次要公式 → 保留 $...$ 格式，**直接与文本混排，不用text文本，不强制分行**；
+• 多行对齐公式 → 用 \begin{equation}\begin{aligned} 第一行 \\ 第二行 \end{aligned}\end{equation}；
+3. 语法红线：严禁用 $ 包裹 equation 环境，文本/描述文字绝对不放入公式环境；
+4. 强制定理环境：文中出现「定理、定义、引理、推论」必须立即包裹对应环境；
+5. 内容保护：100%保留原文文字、公式内容、符号、顺序，不修改公式内容、不增删文字；
+6. 禁止额外操作：绝不自动添加\label、绝不新增文字、绝不修改原文结构。
+
+原始OCR文本：
+{ocr_text}"""
+
+# --- Logging ---
 LOG_FILE = Path(__file__).parent / "server.log"
 logging.basicConfig(
     level=logging.INFO,
@@ -46,11 +86,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logger.info(f"=== Server starting, log file: {LOG_FILE} ===")
+logger.info(f"=== LocalTexOCR Server starting ===")
 
-app = FastAPI(title="Folio-OCR Service", version="3.2.0")
+app = FastAPI(title="LocalTexOCR Service", version="1.0.0")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,27 +98,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Directories
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Ollama config
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "glm-ocr")
-OCR_PROMPT = "识别图片中的全部内容，输出Markdown格式。跳过页眉页脚和页码。"
+# --- DB ---
+DB_PATH = Path(os.environ.get("DB_PATH", Path(__file__).parent / "localtexocr.db"))
 
-# LaTeX → Unicode mapping (loaded once at import time)
-_LATEX_MAP_FILE = Path(__file__).parent / "latex_unicode.json"
-with open(_LATEX_MAP_FILE, "r", encoding="utf-8") as _f:
-    _LATEX_DATA = json.load(_f)
-_LATEX_SIMPLE: list[tuple[str, str]] = sorted(
-    _LATEX_DATA["simple"].items(), key=lambda x: -len(x[0])
-)  # longest match first
-_LATEX_FRACTIONS: dict[str, str] = _LATEX_DATA.get("fractions", {})
-_CIRCLED = {str(i): chr(0x2460 + i - 1) for i in range(1, 21)}  # ①-⑳
-
-# --- SQLite persistence ---
-DB_PATH = Path(os.environ.get("DB_PATH", Path(__file__).parent / "folio_ocr.db"))
+MAX_IMAGE_HEIGHT = 1600
+SEGMENT_OVERLAP  = 80
 
 
 def _init_db():
@@ -96,12 +122,45 @@ def _init_db():
             num         INTEGER NOT NULL,
             filename    TEXT NOT NULL,
             ocr_text    TEXT,
-            ocr_regions TEXT,
             ocr_time    REAL,
             PRIMARY KEY (doc_id, num)
         );
+        CREATE TABLE IF NOT EXISTS prompts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            name       TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            type       TEXT NOT NULL DEFAULT 'format',
+            created_at TEXT NOT NULL
+        );
     """)
     conn.commit()
+
+    # Migrate: add new columns to pages if missing
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(pages)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    for col, typedef in [
+        ("formatted_text", "TEXT"),
+        ("format_time",    "REAL"),
+        ("prompt_id",      "INTEGER"),
+    ]:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE pages ADD COLUMN {col} {typedef}")
+    conn.commit()
+
+    # Seed default prompts if empty
+    count = conn.execute("SELECT COUNT(*) FROM prompts").fetchone()[0]
+    if count == 0:
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO prompts (name, content, type, created_at) VALUES (?, ?, ?, ?)",
+            ("默认OCR提示词", DEFAULT_OCR_PROMPT, "ocr", now),
+        )
+        conn.execute(
+            "INSERT INTO prompts (name, content, type, created_at) VALUES (?, ?, ?, ?)",
+            ("默认格式化提示词", DEFAULT_FORMAT_PROMPT, "format", now),
+        )
+        conn.commit()
     conn.close()
 
 
@@ -126,42 +185,18 @@ _init_db()
 # Shared httpx client
 _http_client: httpx.AsyncClient | None = None
 
-# Layout detection model (PP-DocLayoutV3)
-_LAYOUT_MODEL_NAME = "PaddlePaddle/PP-DocLayoutV3_safetensors"
-_layout_processor = None
-_layout_model = None
-# Labels to skip (not useful for OCR text mapping)
-_LAYOUT_SKIP_LABELS = {"header", "footer", "footnote", "number"}
-# Labels that must be OCR'd individually (not merged with neighbors)
-_LAYOUT_SOLO_LABELS = {"table", "figure"}
-_LAYOUT_THRESHOLD = 0.5
-
-
-def _ensure_layout_model():
-    """Lazy-load torch + transformers + layout model on first use."""
-    global _layout_processor, _layout_model
-    if _layout_model is not None:
-        return
-    import torch
-    from transformers import RTDetrImageProcessor, AutoModelForObjectDetection
-    t0 = time.time()
-    logger.info(f"[layout] Loading {_LAYOUT_MODEL_NAME}...")
-    _layout_processor = RTDetrImageProcessor.from_pretrained(_LAYOUT_MODEL_NAME)
-    _layout_model = AutoModelForObjectDetection.from_pretrained(_LAYOUT_MODEL_NAME)
-    if torch.cuda.is_available():
-        _layout_model.to("cuda")
-        logger.info(f"[layout] Model loaded on CUDA: {time.time() - t0:.2f}s")
-    else:
-        logger.info(f"[layout] Model loaded on CPU: {time.time() - t0:.2f}s")
-    _layout_model.eval()
-
 
 @app.on_event("startup")
 async def startup_event():
     global _http_client
-    _http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
-
-    # Clean up orphan directories not tracked in DB
+    # Use direct transports for localhost so system proxies are bypassed
+    _http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(300.0),
+        mounts={
+            "http://localhost":  httpx.AsyncHTTPTransport(),
+            "http://127.0.0.1": httpx.AsyncHTTPTransport(),
+        },
+    )
     with get_db() as conn:
         rows = conn.execute("SELECT doc_id FROM documents").fetchall()
         known_ids = {r["doc_id"] for r in rows}
@@ -178,8 +213,9 @@ async def shutdown_event():
         await _http_client.aclose()
 
 
+# --- Ollama helpers ---
+
 async def check_ollama() -> dict:
-    """Check Ollama status and model availability"""
     try:
         resp = await _http_client.get(f"{OLLAMA_BASE}/api/tags", timeout=5.0)
         resp.raise_for_status()
@@ -191,633 +227,84 @@ async def check_ollama() -> dict:
         return {"online": False, "model_loaded": False, "models": []}
 
 
-# Max image height for single OCR call (fallback when layout detection returns nothing)
-MAX_IMAGE_HEIGHT = 1600
-SEGMENT_OVERLAP = 80
-
-
-def detect_layout(img: Image.Image) -> list[dict]:
-    """Detect document layout regions using PP-DocLayoutV3.
-    Returns [{label, bbox: [x1,y1,x2,y2], score}] sorted by reading order (top-to-bottom).
-    """
-    import torch
-    _ensure_layout_model()
-    device = next(_layout_model.parameters()).device
-    inputs = _layout_processor(images=img, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        outputs = _layout_model(**inputs)
-
-    target_sizes = torch.tensor([img.size[::-1]], device=device)  # (height, width)
-    results = _layout_processor.post_process_object_detection(
-        outputs, target_sizes=target_sizes, threshold=_LAYOUT_THRESHOLD
-    )[0]
-
-    regions = []
-    id2label = _layout_model.config.id2label
-    for score, label_id, box in zip(results["scores"], results["labels"], results["boxes"]):
-        label = id2label[label_id.item()]
-        if label in _LAYOUT_SKIP_LABELS:
-            continue
-        bbox = [round(c) for c in box.tolist()]  # [x1, y1, x2, y2] in pixels
-        regions.append({"label": label, "bbox": bbox, "score": round(score.item(), 3)})
-
-    # Sort by column-aware reading order
-    regions = _sort_by_columns(regions, img.size[0])
-
-    # Fill gaps between full-width bottom and each column's first region
-    regions = _fill_column_gaps(regions, img.size[0])
-
-    logger.info(f"[layout] Detected {len(regions)} regions")
-    return regions
-
-
-def _fill_column_gaps(regions: list[dict], img_width: int) -> list[dict]:
-    """Insert synthetic regions to cover gaps between the full-width area bottom
-    and each column's first detected region. This catches text the layout model missed
-    (e.g., question options that span across column boundaries).
-    """
-    if not regions:
-        return regions
-
-    # Find full-width bottom edge — only if column 0 is a real full-width group
-    # (has title labels or wide regions), not just a regular left column
-    has_fullwidth = any(
-        r.get("_column") == 0 and (
-            r.get("label") in {"doc_title", "paragraph_title", "title", "section_title"}
-            or (r["bbox"][2] - r["bbox"][0]) > img_width * 0.6
+async def ensure_ollama_running() -> dict:
+    ollama = await check_ollama()
+    if ollama["online"]:
+        return ollama
+    logger.info("[ollama] Not running, attempting to start ollama serve...")
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-        for r in regions
-    )
-    fullwidth_bottom = 0
-    if has_fullwidth:
-        for r in regions:
-            if r.get("_column") == 0:
-                fullwidth_bottom = max(fullwidth_bottom, r["bbox"][3])
-
-    if fullwidth_bottom == 0:
-        return regions
-
-    # Group regions by column
-    col_regions: dict[int, list[dict]] = {}
-    for r in regions:
-        col = r.get("_column")
-        if col is not None and col > 0:
-            col_regions.setdefault(col, []).append(r)
-
-    gap_regions = []
-    MIN_GAP = 15  # only fill gaps larger than this (pixels)
-
-    for col_id, col_regs in col_regions.items():
-        # First region in this column (already sorted by y)
-        first = col_regs[0]
-        first_y = first["bbox"][1]
-
-        if first_y - fullwidth_bottom > MIN_GAP:
-            # There's a gap — insert a synthetic region
-            x1 = min(r["bbox"][0] for r in col_regs)
-            x2 = max(r["bbox"][2] for r in col_regs)
-            gap_bbox = [x1, fullwidth_bottom, x2, first_y]
-            gap_region = {
-                "label": "text",
-                "bbox": gap_bbox,
-                "score": 0.5,
-                "_column": col_id,
-                "_synthetic": True,
-            }
-            gap_regions.append(gap_region)
-            logger.info(f"[layout] Filled gap in column {col_id}: y={fullwidth_bottom}-{first_y}")
-
-    if not gap_regions:
-        return regions
-
-    # Insert gap regions right before each column's first region
-    result = []
-    inserted_cols = set()
-    for r in regions:
-        col = r.get("_column")
-        if col is not None and col > 0 and col not in inserted_cols:
-            # Insert any gap region for this column before its first region
-            for gr in gap_regions:
-                if gr["_column"] == col:
-                    result.append(gr)
-            inserted_cols.add(col)
-        result.append(r)
-
-    return result
+    except FileNotFoundError:
+        raise HTTPException(500, "Ollama not found. Please install Ollama first.")
+    for i in range(60):
+        await asyncio.sleep(0.5)
+        ollama = await check_ollama()
+        if ollama["online"]:
+            return ollama
+    raise HTTPException(500, "Failed to start Ollama after 30s")
 
 
-def _detect_columns(regions: list[dict], img_width: int) -> list[list[dict]]:
-    """Detect multi-column layout by clustering region x-centers.
-    Returns list of columns (each a list of regions), left-to-right.
-    Full-width regions (spanning >60% of image width) are NOT assigned to columns;
-    they are returned as a special first "column" to be placed before columnar content.
-    """
-    if not regions:
-        return []
+# --- OCR helpers ---
 
-    FULL_WIDTH_RATIO = 0.6  # regions wider than this fraction are "full-width"
-    # Labels that are always treated as full-width (headers, titles)
-    FULL_WIDTH_LABELS = {"doc_title", "paragraph_title", "title", "section_title"}
-    full_width = []
-    narrow = []
-
-    img_center = img_width / 2
-    CENTER_TOLERANCE = 0.15  # region center within 15% of image center = "centered"
-
-    MAX_SUBTITLE_HEIGHT = 50  # centered regions taller than this are text blocks, not subtitles
-
-    # First pass: classify by label and width only
-    for r in regions:
-        x1, y1, x2, y2 = r["bbox"]
-        width = x2 - x1
-        if width > img_width * FULL_WIDTH_RATIO or r["label"] in FULL_WIDTH_LABELS:
-            full_width.append(r)
-        else:
-            narrow.append(r)
-
-    # Second pass: only enable centered-subtitle detection if the page has real titles.
-    # This prevents false positives on continuation pages (no headers).
-    has_titles = any(r["label"] in FULL_WIDTH_LABELS for r in full_width)
-    if has_titles:
-        still_narrow = []
-        for r in narrow:
-            x1, y1, x2, y2 = r["bbox"]
-            width = x2 - x1
-            height = y2 - y1
-            cx = (x1 + x2) / 2
-            is_centered = abs(cx - img_center) < img_width * CENTER_TOLERANCE
-            is_single_line = height <= MAX_SUBTITLE_HEIGHT
-            if is_centered and width < img_width * 0.45 and is_single_line:
-                full_width.append(r)
-            else:
-                still_narrow.append(r)
-        narrow = still_narrow
-
-    if not narrow:
-        return [full_width] if full_width else []
-
-    # Cluster narrow regions into columns by x-center
-    centers = [(r["bbox"][0] + r["bbox"][2]) / 2 for r in narrow]
-    columns = _cluster_columns(narrow, centers, img_width)
-
-    # Sort columns left-to-right by average x-center
-    columns.sort(key=lambda col: sum((r["bbox"][0] + r["bbox"][2]) / 2 for r in col) / len(col))
-
-    # Sort regions within each column top-to-bottom
-    for col in columns:
-        col.sort(key=lambda r: r["bbox"][1])
-
-    # Tag each region with its column index for merge grouping
-    if full_width:
-        full_width.sort(key=lambda r: r["bbox"][1])
-        for r in full_width:
-            r["_column"] = 0
-
-    for ci, col in enumerate(columns):
-        for r in col:
-            r["_column"] = ci + (1 if full_width else 0)
-
-    result = []
-    if full_width:
-        result.append(full_width)
-    result.extend(columns)
-    return result
-
-
-def _cluster_columns(regions: list[dict], centers: list[float], img_width: int) -> list[list[dict]]:
-    """Simple 1D clustering of regions into columns by x-center.
-    Uses a gap threshold: if the gap between sorted x-centers exceeds
-    a fraction of the image width, start a new column.
-    """
-    GAP_RATIO = 0.15  # minimum gap between columns as fraction of image width
-    gap_threshold = img_width * GAP_RATIO
-
-    indexed = sorted(enumerate(regions), key=lambda t: centers[t[0]])
-    columns: list[list[dict]] = []
-    current_col: list[dict] = [indexed[0][1]]
-    prev_center = centers[indexed[0][0]]
-
-    for idx, region in indexed[1:]:
-        c = centers[idx]
-        if c - prev_center > gap_threshold:
-            columns.append(current_col)
-            current_col = [region]
-        else:
-            current_col.append(region)
-        prev_center = c
-
-    columns.append(current_col)
-    return columns
-
-
-def _sort_by_columns(regions: list[dict], img_width: int) -> list[dict]:
-    """Sort regions by column-aware reading order.
-    For single-column docs: top-to-bottom.
-    For multi-column docs: full-width first, then left col top-to-bottom, right col top-to-bottom.
-    """
-    columns = _detect_columns(regions, img_width)
-
-    if len(columns) <= 1:
-        # Single column or all full-width: simple top-to-bottom
-        regions.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
-        return regions
-
-    # Multi-column: interleave full-width regions by y-position among columns
-    # Full-width regions (columns[0] if wider) come before each column section
-    # that starts below them
-    sorted_regions = []
-    for col in columns:
-        sorted_regions.extend(col)
-
-    logger.info(f"[layout] Detected {len(columns)} columns "
-                f"({', '.join(str(len(c)) + ' regions' for c in columns)})")
-    return sorted_regions
-
-
-def _merge_adjacent_regions(raw_regions: list[dict]) -> list[list[dict]]:
-    """Group adjacent non-solo regions into merge groups.
-    Returns list of groups, where each group is a list of raw regions.
-    Solo regions (table, figure) always form their own group.
-    Column boundaries (tagged by _detect_columns) split groups.
-    """
-    groups: list[list[dict]] = []
-    current: list[dict] = []
-
-    for region in raw_regions:
-        if region["label"] in _LAYOUT_SOLO_LABELS:
-            if current:
-                groups.append(current)
-                current = []
-            groups.append([region])
-        else:
-            # Split at column boundaries (different _column tag)
-            if current and current[-1].get("_column") != region.get("_column"):
-                groups.append(current)
-                current = []
-            current.append(region)
-
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _group_bbox(regions: list[dict]) -> list[int]:
-    """Compute the bounding box that encompasses all regions."""
-    x1 = min(r["bbox"][0] for r in regions)
-    y1 = min(r["bbox"][1] for r in regions)
-    x2 = max(r["bbox"][2] for r in regions)
-    y2 = max(r["bbox"][3] for r in regions)
-    return [x1, y1, x2, y2]
-
-
-
-def _dedup_regions(regions: list[dict]) -> list[dict]:
-    """Remove regions whose text is entirely contained in another region's text."""
-    if len(regions) <= 1:
-        return regions
-    norms = [re.sub(r'\s+', '', r.get('text', '')) for r in regions]
-    keep = []
-    for i, region in enumerate(regions):
-        if not norms[i]:
-            continue
-        is_dup = False
-        for j, other_norm in enumerate(norms):
-            if i == j or not other_norm:
-                continue
-            if len(norms[i]) < len(other_norm) and norms[i] in other_norm:
-                is_dup = True
-                break
-        if not is_dup:
-            keep.append(region)
-    for i, r in enumerate(keep):
-        r['idx'] = i
-    return keep
-
-
-async def ocr_image_with_layout(image_path: str, merge: bool = True) -> tuple[str, list[dict]]:
-    """Run layout detection + OCR.
-    merge=True:  adjacent text regions merged into fewer OCR calls (fast, coarse regions).
-    merge=False: each region OCR'd individually (slow, fine-grained regions for proofreading).
-    """
-    t0 = time.time()
-    img = Image.open(image_path).convert("RGB")
-
-    # Step 1: Layout detection
-    t1 = time.time()
-    raw_regions = detect_layout(img)
-    logger.info(f"[OCR] Layout detection: {time.time() - t1:.2f}s, {len(raw_regions)} regions")
-
-    # Fallback: if no regions detected, OCR the whole image
-    if not raw_regions:
-        logger.info("[OCR] No layout regions, fallback to whole-image OCR")
-        text = await _ocr_whole_image(img)
-        img.close()
-        elapsed = time.time() - t0
-        logger.info(f"[OCR] TOTAL (fallback): {elapsed:.2f}s")
-        return text, []
-
-    regions = []
-
-    if merge:
-        # Fast path: merge adjacent text regions into groups
-        groups = _merge_adjacent_regions(raw_regions)
-        logger.info(f"[OCR] Merged {len(raw_regions)} regions into {len(groups)} groups")
-
-        for gi, group in enumerate(groups):
-            bbox = _group_bbox(group)
-            cropped = img.crop(bbox)
-            seg_b64 = _image_to_b64(cropped)
-            text = await _ocr_single(seg_b64)
-            text = _postprocess(text)
-
-            label = group[0]["label"] if len(group) == 1 else "text"
-            regions.append({
-                "idx": gi,
-                "label": label,
-                "bbox": bbox,
-                "text": text or "",
-            })
-            logger.info(f"[OCR] Group {gi+1}/{len(groups)} ({label}, {len(group)} merged): {len(text)} chars")
-    else:
-        # Fine-grained path: OCR each region individually
-        for i, region in enumerate(raw_regions):
-            bbox = region["bbox"]
-            cropped = img.crop(bbox)
-            seg_b64 = _image_to_b64(cropped)
-            text = await _ocr_single(seg_b64)
-            text = _postprocess(text)
-
-            regions.append({
-                "idx": i,
-                "label": region["label"],
-                "bbox": bbox,
-                "text": text or "",
-            })
-            logger.info(f"[OCR] Region {i+1}/{len(raw_regions)} ({region['label']}): {len(text)} chars")
-
-    img.close()
-
-    # Cross-region dedup: remove regions whose text is entirely contained in another region
-    regions = _dedup_regions(regions)
-    combined = "\n\n".join(r["text"] for r in regions if r["text"])
-    combined = _dedup_lines(combined)
-    n_calls = len(regions)
-    logger.info(f"[OCR] TOTAL: {time.time() - t0:.2f}s ({len(raw_regions)} regions, {n_calls} calls, merge={'on' if merge else 'off'})")
-    return combined, regions
-
-
-async def _ocr_whole_image(img: Image.Image) -> str:
-    """Fallback: OCR whole image, with splitting for tall images."""
-    w, h = img.size
-    if h > MAX_IMAGE_HEIGHT:
-        segments = _split_image(img)
-    else:
-        segments = [img]
-
-    all_text = []
-    for seg in segments:
-        seg_b64 = _image_to_b64(seg)
-        text = await _ocr_single(seg_b64)
-        text = _postprocess(text)
-        if text:
-            all_text.append(text)
-    return "\n\n".join(all_text)
+def _image_to_b64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def _split_image(img: Image.Image) -> list[Image.Image]:
-    """Split a tall image into overlapping segments."""
     w, h = img.size
     step = MAX_IMAGE_HEIGHT - SEGMENT_OVERLAP
-    segments = []
-    y = 0
+    segments, y = [], 0
     while y < h:
         bottom = min(y + MAX_IMAGE_HEIGHT, h)
-        seg = img.crop((0, y, w, bottom))
-        segments.append(seg)
+        segments.append(img.crop((0, y, w, bottom)))
         y += step
         if bottom == h:
             break
     return segments
 
 
-def _image_to_b64(img: Image.Image) -> str:
-    """Convert PIL Image to base64 PNG string."""
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-async def _ocr_single(image_b64: str) -> str:
-    """Send a single image to Ollama for OCR."""
+async def _ocr_single(image_b64: str, model: str, prompt: str) -> str:
     resp = await _http_client.post(
         f"{OLLAMA_BASE}/api/chat",
         json={
-            "model": OLLAMA_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": OCR_PROMPT,
-                    "images": [image_b64],
-                }
-            ],
+            "model": model,
+            "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
             "stream": False,
         },
     )
     resp.raise_for_status()
-    result = resp.json()
-    return result.get("message", {}).get("content", "")
+    return resp.json().get("message", {}).get("content", "")
 
 
-def _postprocess(text: str) -> str:
-    """Strip markdown fences and convert LaTeX to Unicode."""
-    text = re.sub(r'^```\w*\n?', '', text.strip())
-    text = re.sub(r'\n?```$', '', text.strip())
-    # Flatten simple HTML tables (only text cells) into plain text lines
-    text = _flatten_simple_tables(text)
-    # Remove standalone $$...$$ lines whose content duplicates nearby $...$ inline math
-    text = _remove_duplicate_display_math(text)
-    text = _latex_to_unicode(text)
-    text = _dedup_lines(text)
-    return text.strip()
+async def ocr_image(image_path: str, model: str, prompt: str) -> str:
+    img = Image.open(image_path).convert("RGB")
+    segments = _split_image(img) if img.size[1] > MAX_IMAGE_HEIGHT else [img]
+    results = []
+    for seg in segments:
+        text = await _ocr_single(_image_to_b64(seg), model, prompt)
+        if text:
+            results.append(text)
+    img.close()
+    return "\n\n".join(results)
 
 
-def _flatten_simple_tables(text: str) -> str:
-    """Convert simple HTML tables (text-only cells) into plain text.
-    Each row becomes a line with cells joined by spaces.
-    Complex tables (with nested tags, images, etc.) are left as-is.
-    """
-    def _replace_table(m):
-        html = m.group(0)
-        # Reject if it contains nested tables or images
-        if '<table' in html[7:] or '<img' in html.lower():
-            return html
-        parser = _TableParser()
-        parser.feed(html)
-        if not parser.rows:
-            return html
-        lines = []
-        for row in parser.rows:
-            # Filter out empty cells, join with space
-            cells = [c for c in row if c.strip()]
-            if cells:
-                lines.append(" ".join(cells))
-        return "\n".join(lines)
-
-    return re.sub(r'<table[\s\S]*?</table>', _replace_table, text, flags=re.IGNORECASE)
+def _get_prompt(conn, prompt_id: int | None, default: str) -> str:
+    if prompt_id is None:
+        return default
+    row = conn.execute("SELECT content FROM prompts WHERE id=?", (prompt_id,)).fetchone()
+    return row["content"] if row else default
 
 
-def _remove_duplicate_display_math(text: str) -> str:
-    """Remove $$...$$ display math lines that duplicate $...$ inline math content."""
-    lines = text.split('\n')
-    # Collect all inline math content (normalized)
-    inline_contents = set()
-    for line in lines:
-        for m in re.finditer(r'\$([^$]+)\$', line):
-            # Normalize: strip spaces
-            normalized = re.sub(r'\s+', '', m.group(1))
-            inline_contents.add(normalized)
-
-    # Filter out standalone $$...$$ lines whose content matches an inline math
-    result = []
-    for line in lines:
-        stripped = line.strip()
-        m = re.match(r'^\$\$(.+)\$\$$', stripped)
-        if m:
-            normalized = re.sub(r'\s+', '', m.group(1))
-            if normalized in inline_contents:
-                continue  # skip duplicate display math
-        result.append(line)
-    return '\n'.join(result)
-
-
-def _dedup_lines(text: str) -> str:
-    """Remove lines whose normalized content is a substring of any earlier line.
-    Catches GLM-OCR's duplicate display math even when separated by other lines.
-    """
-    lines = text.split('\n')
-    if len(lines) <= 1:
-        return text
-
-    result = [lines[0]]
-    # Keep normalized versions of all accepted lines for fast lookup
-    seen_norms = [re.sub(r'\s+', '', lines[0])]
-
-    for line in lines[1:]:
-        curr_norm = re.sub(r'\s+', '', line)
-        if not curr_norm:
-            result.append(line)  # keep blank lines
-            continue
-
-        # Check if current line is a duplicate/substring of ANY earlier line
-        is_dup = False
-        for prev_norm in seen_norms:
-            if curr_norm == prev_norm:
-                is_dup = True
-                break
-            if len(curr_norm) > 2 and curr_norm in prev_norm:
-                is_dup = True
-                break
-        if is_dup:
-            continue
-
-        result.append(line)
-        seen_norms.append(curr_norm)
-
-    return '\n'.join(result)
-
-
-def _latex_to_unicode(text: str) -> str:
-    """Replace LaTeX notation with Unicode characters using latex_unicode.json"""
-
-    # 1. \textcircled{N} → ①②③...
-    text = re.sub(
-        r'\$\\textcircled\{(\d+)\}\$',
-        lambda m: _CIRCLED.get(m.group(1), m.group(0)),
-        text,
-    )
-
-    # 2. \frac{a}{b} → Unicode fraction (½ etc.) or a/b
-    def _replace_frac(m):
-        num, den = m.group(1), m.group(2)
-        key = f"{num}/{den}"
-        return _LATEX_FRACTIONS.get(key, f"{num}/{den}")
-
-    text = re.sub(r'\$\\frac\{([^}]+)\}\{([^}]+)\}\$', _replace_frac, text)
-
-    # 3. Inline math $...$ and display math $$...$$ → convert interior then strip delimiters
-    text = re.sub(r'\$\$(.+?)\$\$', lambda m: _convert_math_interior(m.group(1)), text, flags=re.DOTALL)
-    text = re.sub(r'\$(.+?)\$', lambda m: _convert_math_interior(m.group(1)), text)
-
-    # 4. Simple $\command$ → Unicode (longest match first) — catch any remaining
-    for latex_cmd, unicode_char in _LATEX_SIMPLE:
-        token = f"${latex_cmd}$"
-        if token in text:
-            text = text.replace(token, unicode_char)
-
-    # 5. Remaining bare $\command$ patterns not in map — unwrap the $ delimiters
-    text = re.sub(r'\$\\([a-zA-Z]+)\$', lambda m: '\\' + m.group(1), text)
-
-    return text
-
-
-def _convert_math_interior(math: str) -> str:
-    """Convert LaTeX math content to Unicode plain text.
-    Handles: ^{\\circ} → °, \\sim → ~, \\times → ×, etc.
-    Collapses spurious spaces between digits: '1 5' → '15'.
-    """
-    s = math.strip()
-
-    # ^{\circ} or ^\circ → ° (degree symbol)
-    s = re.sub(r'\^\{\\circ\}', '°', s)
-    s = re.sub(r'\^\\circ', '°', s)
-
-    # ^{...} superscript — for single char/digit, use Unicode superscript if possible
-    # For complex content, just append it
-    s = re.sub(r'\^\{([^}]+)\}', lambda m: m.group(1), s)
-    s = re.sub(r'\^(\d)', lambda m: m.group(1), s)
-
-    # _{...} subscript — similar treatment
-    s = re.sub(r'_\{([^}]+)\}', lambda m: m.group(1), s)
-    s = re.sub(r'_(\d)', lambda m: m.group(1), s)
-
-    # Replace LaTeX commands with Unicode (longest match first)
-    for latex_cmd, unicode_char in _LATEX_SIMPLE:
-        if latex_cmd in s:
-            s = s.replace(latex_cmd, unicode_char)
-
-    # Remove remaining braces
-    s = s.replace('{', '').replace('}', '')
-
-    # Collapse spaces between digits: "1 5" → "15", "2 0" → "20"
-    s = re.sub(r'(\d)\s+(\d)', r'\1\2', s)
-
-    # Clean up multiple spaces
-    s = re.sub(r' {2,}', ' ', s)
-
-    return s.strip()
-
-
-def pdf_to_images(pdf_path: str, output_dir: Path) -> list[str]:
-    """Convert PDF pages to images in the specified directory"""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    filenames = []
-    mat = fitz.Matrix(2.0, 2.0)
-    doc = fitz.open(pdf_path)
-
-    for page_num, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=mat)
-        filename = f"page_{page_num + 1:03d}.png"
-        pix.save(str(output_dir / filename))
-        filenames.append(filename)
-
-    doc.close()
-    return filenames
-
+# --- Path helpers ---
 
 def _safe_doc_path(doc_id: str, filename: str = "") -> Path:
-    """Build a path inside UPLOAD_DIR/{doc_id} with traversal protection"""
     doc_dir = (UPLOAD_DIR / doc_id).resolve()
     if not str(doc_dir).startswith(str(UPLOAD_DIR.resolve())):
         raise HTTPException(403, "Invalid document ID")
@@ -829,100 +316,98 @@ def _safe_doc_path(doc_id: str, filename: str = "") -> Path:
     return doc_dir
 
 
-# --- Endpoints ---
+# ===================== ENDPOINTS =====================
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    """Serve frontend page"""
     with open("index.html", "r", encoding="utf-8") as f:
         return f.read()
 
 
 @app.get("/api/status")
 async def status():
-    """Check service status"""
     ollama = await check_ollama()
     return {
         "status": "running",
         "model_loaded": ollama["model_loaded"],
-        "layout_loaded": _layout_model is not None,
         "device": "ollama",
-        "gpu": {"name": f"Ollama ({OLLAMA_MODEL})"} if ollama["online"] else None,
     }
 
 
-async def ensure_ollama_running() -> dict:
-    """Start Ollama if not running, wait until ready"""
+@app.get("/api/models")
+async def list_models():
     ollama = await check_ollama()
-    if ollama["online"]:
-        return ollama
+    return {"models": ollama["models"], "online": ollama["online"]}
 
-    logger.info("[ollama] Not running, attempting to start ollama serve...")
-    try:
-        subprocess.Popen(
-            ["ollama", "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+
+# --- Prompts CRUD ---
+
+class _PromptRequest(BaseModel):
+    name: str
+    content: str
+    type: str = "format"
+
+
+@app.get("/api/prompts")
+async def list_prompts(type: str = Query(None)):
+    with get_db() as conn:
+        if type:
+            rows = conn.execute(
+                "SELECT * FROM prompts WHERE type=? ORDER BY id", (type,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM prompts ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/prompts")
+async def create_prompt(req: _PromptRequest):
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO prompts (name, content, type, created_at) VALUES (?, ?, ?, ?)",
+            (req.name, req.content, req.type, now),
         )
-        logger.info("[ollama] Popen launched, waiting for service...")
-    except FileNotFoundError:
-        logger.error("[ollama] 'ollama' command not found in PATH")
-        raise HTTPException(500, "Ollama not found. Please install Ollama first.")
-    except Exception as e:
-        logger.error(f"[ollama] Failed to start: {e}", exc_info=True)
-        raise HTTPException(500, f"Failed to start Ollama: {e}")
-
-    for i in range(60):
-        await asyncio.sleep(0.5)
-        ollama = await check_ollama()
-        if ollama["online"]:
-            logger.info(f"[ollama] Started in {(i + 1) * 0.5:.1f}s")
-            return ollama
-
-    raise HTTPException(500, "Failed to start Ollama after 30s")
+        new_id = cur.lastrowid
+    return {"id": new_id, "name": req.name, "content": req.content,
+            "type": req.type, "created_at": now}
 
 
-@app.post("/api/load-model")
-async def load_model_endpoint():
-    """Load layout model + start Ollama + pre-warm OCR model"""
-    # Load layout detection model (heavy: torch + transformers)
-    if _layout_model is None:
-        await asyncio.to_thread(_ensure_layout_model)
-
-    ollama = await ensure_ollama_running()
-
-    if not ollama["model_loaded"]:
-        raise HTTPException(500, f"Model '{OLLAMA_MODEL}' not found. Run: ollama pull {OLLAMA_MODEL}")
-
-    try:
-        t0 = time.time()
-        await _http_client.post(
-            f"{OLLAMA_BASE}/api/chat",
-            json={"model": OLLAMA_MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": False},
+@app.put("/api/prompts/{prompt_id}")
+async def update_prompt(prompt_id: int, req: _PromptRequest):
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE prompts SET name=?, content=?, type=? WHERE id=?",
+            (req.name, req.content, req.type, prompt_id),
         )
-        logger.info(f"[load_model] Warmup done: {time.time() - t0:.2f}s")
-    except Exception as e:
-        logger.warning(f"[load_model] Warmup failed: {e}")
-    return {"success": True, "message": "All models loaded"}
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Prompt not found")
+    return {"success": True}
 
+
+@app.delete("/api/prompts/{prompt_id}")
+async def delete_prompt(prompt_id: int):
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM prompts WHERE id=?", (prompt_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "Prompt not found")
+    return {"success": True}
+
+
+# --- Upload ---
 
 ALLOWED_SUFFIXES = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.pdf'}
 
 
 @app.post("/api/upload")
 async def upload_files(files: list[UploadFile] = File(...)):
-    """Upload one or more files. Multiple images become pages of one document.
-    Always streams pages via SSE so the frontend gets incremental updates."""
     if not files:
         raise HTTPException(400, "No files provided")
-
     for f in files:
         if Path(f.filename).suffix.lower() not in ALLOWED_SUFFIXES:
             raise HTTPException(400, f"Unsupported file type: {f.filename}")
 
-    # Read all file contents upfront (before entering the generator)
-    file_data: list[tuple[str, str, bytes]] = []  # (filename, suffix, content)
+    file_data: list[tuple[str, str, bytes]] = []
     for f in files:
         suffix = Path(f.filename).suffix.lower()
         content = await f.read()
@@ -931,14 +416,9 @@ async def upload_files(files: list[UploadFile] = File(...)):
     doc_id = str(uuid.uuid4())
     doc_dir = UPLOAD_DIR / doc_id
     doc_dir.mkdir(parents=True, exist_ok=True)
-
-    # Display name
-    if len(file_data) == 1:
-        display_name = file_data[0][0]
-    else:
-        display_name = f"{len(file_data)} files"
-
+    display_name = file_data[0][0] if len(file_data) == 1 else f"{len(file_data)} files"
     created_at = datetime.now().isoformat()
+
     with get_db() as conn:
         conn.execute(
             "INSERT INTO documents (doc_id, filename, created_at) VALUES (?, ?, ?)",
@@ -947,16 +427,13 @@ async def upload_files(files: list[UploadFile] = File(...)):
 
     async def generate():
         page_num = 0
-
         yield f"data: {json.dumps({'type': 'init', 'doc_id': doc_id, 'filename': display_name})}\n\n"
 
         for fname, suffix, content in file_data:
             if suffix == ".pdf":
-                # Save PDF, extract pages
                 pdf_path = doc_dir / f"src_{uuid.uuid4().hex[:8]}.pdf"
                 with open(pdf_path, "wb") as fp:
                     fp.write(content)
-
                 mat = fitz.Matrix(2.0, 2.0)
                 doc = fitz.open(str(pdf_path))
                 for fitz_page in doc:
@@ -964,48 +441,26 @@ async def upload_files(files: list[UploadFile] = File(...)):
                     pix = fitz_page.get_pixmap(matrix=mat)
                     img_name = f"page_{page_num:03d}.png"
                     pix.save(str(doc_dir / img_name))
-
                     with get_db() as conn:
                         conn.execute(
                             "INSERT INTO pages (doc_id, num, filename) VALUES (?, ?, ?)",
                             (doc_id, page_num, img_name),
                         )
-
-                    page_info = {
-                        "num": page_num,
-                        "filename": img_name,
-                        "image_url": f"/api/images/{doc_id}/{img_name}",
-                        "ocr_text": None,
-                        "ocr_regions": None,
-                        "ocr_time": None,
-                    }
-                    yield f"data: {json.dumps({'type': 'page', 'page': page_info})}\n\n"
+                    yield f"data: {json.dumps({'type': 'page', 'page': _page_info(doc_id, page_num, img_name)})}\n\n"
                     await asyncio.sleep(0)
-
                 doc.close()
                 pdf_path.unlink(missing_ok=True)
             else:
-                # Single image
                 page_num += 1
                 img_name = f"page_{page_num:03d}{suffix}"
                 with open(doc_dir / img_name, "wb") as fp:
                     fp.write(content)
-
                 with get_db() as conn:
                     conn.execute(
                         "INSERT INTO pages (doc_id, num, filename) VALUES (?, ?, ?)",
                         (doc_id, page_num, img_name),
                     )
-
-                page_info = {
-                    "num": page_num,
-                    "filename": img_name,
-                    "image_url": f"/api/images/{doc_id}/{img_name}",
-                    "ocr_text": None,
-                    "ocr_regions": None,
-                    "ocr_time": None,
-                }
-                yield f"data: {json.dumps({'type': 'page', 'page': page_info})}\n\n"
+                yield f"data: {json.dumps({'type': 'page', 'page': _page_info(doc_id, page_num, img_name)})}\n\n"
                 await asyncio.sleep(0)
 
         yield f"data: {json.dumps({'type': 'done', 'page_count': page_num})}\n\n"
@@ -1014,71 +469,45 @@ async def upload_files(files: list[UploadFile] = File(...)):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+def _page_info(doc_id: str, num: int, filename: str, page_row=None) -> dict:
+    """Build a page info dict for API responses."""
+    if page_row:
+        return {
+            "num": page_row["num"],
+            "filename": page_row["filename"],
+            "image_url": f"/api/images/{doc_id}/{page_row['filename']}",
+            "ocr_text": page_row["ocr_text"],
+            "ocr_time": page_row["ocr_time"],
+            "formatted_text": page_row["formatted_text"],
+            "format_time": page_row["format_time"],
+        }
+    return {
+        "num": num,
+        "filename": filename,
+        "image_url": f"/api/images/{doc_id}/{filename}",
+        "ocr_text": None,
+        "ocr_time": None,
+        "formatted_text": None,
+        "format_time": None,
+    }
+
+
 @app.get("/api/images/{doc_id}/{filename}")
 async def get_image(doc_id: str, filename: str):
-    """Serve an uploaded page image"""
     file_path = _safe_doc_path(doc_id, filename)
     if not file_path.exists():
         raise HTTPException(404, "Image not found")
     return FileResponse(file_path, media_type="image/png")
 
 
-@app.post("/api/ocr/{doc_id}/{page_num}")
-async def ocr_single_page(doc_id: str, page_num: int, layout: bool = Query(True), force: bool = Query(False)):
-    """Run OCR on a single page. Pass ?force=true to re-scan ignoring cache."""
-    with get_db() as conn:
-        page = conn.execute(
-            "SELECT * FROM pages WHERE doc_id=? AND num=?", (doc_id, page_num)
-        ).fetchone()
-    if page is None:
-        raise HTTPException(404, f"Page {page_num} not found")
-
-    # If already OCR'd and not forced, return cached result
-    if page["ocr_text"] is not None and not force:
-        return {
-            "doc_id": doc_id,
-            "page_num": page_num,
-            "text": page["ocr_text"],
-            "regions": json.loads(page["ocr_regions"]) if page["ocr_regions"] else [],
-            "time": page["ocr_time"],
-            "cached": True,
-        }
-
-    image_path = _safe_doc_path(doc_id, page["filename"])
-    if not image_path.exists():
-        raise HTTPException(404, "Image file not found")
-
-    try:
-        t0 = time.time()
-        text, regions = await ocr_image_with_layout(str(image_path), merge=not layout)
-        elapsed = round(time.time() - t0, 2)
-
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE pages SET ocr_text=?, ocr_regions=?, ocr_time=? WHERE doc_id=? AND num=?",
-                (text, json.dumps(regions), elapsed, doc_id, page_num),
-            )
-
-        return {
-            "doc_id": doc_id,
-            "page_num": page_num,
-            "text": text,
-            "regions": regions,
-            "time": elapsed,
-            "cached": False,
-        }
-    except httpx.HTTPStatusError as e:
-        detail = e.response.text
-        logger.error(f"[OCR] Ollama error: {detail}", exc_info=True)
-        raise HTTPException(500, f"OCR failed: {detail}")
-    except Exception as e:
-        logger.error(f"[OCR] Error: {e}", exc_info=True)
-        raise HTTPException(500, f"OCR failed: {e}")
-
+# --- OCR endpoints ---
 
 @app.post("/api/ocr/{doc_id}/all")
-async def ocr_all_pages(doc_id: str, layout: bool = Query(True)):
-    """Run OCR on all pages of a document. Pass ?layout=false to skip layout detection."""
+async def ocr_all_pages(
+    doc_id: str,
+    model: str = Query(None),
+    prompt_id: int = Query(None),
+):
     with get_db() as conn:
         doc_row = conn.execute(
             "SELECT * FROM documents WHERE doc_id=?", (doc_id,)
@@ -1088,74 +517,246 @@ async def ocr_all_pages(doc_id: str, layout: bool = Query(True)):
         pages = conn.execute(
             "SELECT * FROM pages WHERE doc_id=? ORDER BY num", (doc_id,)
         ).fetchall()
+        ocr_prompt = _get_prompt(conn, prompt_id, DEFAULT_OCR_PROMPT)
 
+    ocr_model = model or OLLAMA_MODEL
     results = []
 
     for page in pages:
         if page["ocr_text"] is not None:
             results.append({
-                "page_num": page["num"],
-                "text": page["ocr_text"],
-                "regions": json.loads(page["ocr_regions"]) if page["ocr_regions"] else [],
-                "time": page["ocr_time"],
-                "cached": True,
+                "page_num": page["num"], "text": page["ocr_text"],
+                "time": page["ocr_time"], "cached": True,
             })
             continue
-
         image_path = _safe_doc_path(doc_id, page["filename"])
         try:
             t0 = time.time()
-            text, regions = await ocr_image_with_layout(str(image_path), merge=not layout)
+            text = await ocr_image(str(image_path), ocr_model, ocr_prompt)
             elapsed = round(time.time() - t0, 2)
-
             with get_db() as conn:
                 conn.execute(
-                    "UPDATE pages SET ocr_text=?, ocr_regions=?, ocr_time=? WHERE doc_id=? AND num=?",
-                    (text, json.dumps(regions), elapsed, doc_id, page["num"]),
+                    "UPDATE pages SET ocr_text=?, ocr_time=? WHERE doc_id=? AND num=?",
+                    (text, elapsed, doc_id, page["num"]),
                 )
-
-            results.append({
-                "page_num": page["num"],
-                "text": text,
-                "regions": regions,
-                "time": elapsed,
-                "cached": False,
-            })
+            results.append({"page_num": page["num"], "text": text, "time": elapsed, "cached": False})
         except Exception as e:
             logger.error(f"[OCR] Page {page['num']} error: {e}", exc_info=True)
-            results.append({
-                "page_num": page["num"],
-                "text": None,
-                "regions": [],
-                "time": None,
-                "error": str(e),
-            })
+            results.append({"page_num": page["num"], "text": None, "time": None, "error": str(e)})
 
-    return {
-        "doc_id": doc_id,
-        "filename": doc_row["filename"],
-        "results": results,
-    }
+    return {"doc_id": doc_id, "filename": doc_row["filename"], "results": results}
 
+
+@app.post("/api/ocr/{doc_id}/{page_num}")
+async def ocr_single_page(
+    doc_id: str,
+    page_num: int,
+    model: str = Query(None),
+    prompt_id: int = Query(None),
+    force: bool = Query(False),
+):
+    with get_db() as conn:
+        page = conn.execute(
+            "SELECT * FROM pages WHERE doc_id=? AND num=?", (doc_id, page_num)
+        ).fetchone()
+        ocr_prompt = _get_prompt(conn, prompt_id, DEFAULT_OCR_PROMPT)
+
+    if page is None:
+        raise HTTPException(404, f"Page {page_num} not found")
+    if page["ocr_text"] is not None and not force:
+        return {
+            "doc_id": doc_id, "page_num": page_num,
+            "text": page["ocr_text"], "time": page["ocr_time"], "cached": True,
+        }
+
+    ocr_model = model or OLLAMA_MODEL
+    image_path = _safe_doc_path(doc_id, page["filename"])
+    if not image_path.exists():
+        raise HTTPException(404, "Image file not found")
+
+    try:
+        t0 = time.time()
+        text = await ocr_image(str(image_path), ocr_model, ocr_prompt)
+        elapsed = round(time.time() - t0, 2)
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE pages SET ocr_text=?, ocr_time=? WHERE doc_id=? AND num=?",
+                (text, elapsed, doc_id, page_num),
+            )
+        return {"doc_id": doc_id, "page_num": page_num, "text": text, "time": elapsed, "cached": False}
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(500, f"OCR failed: {e.response.text}")
+    except Exception as e:
+        logger.error(f"[OCR] Error: {e}", exc_info=True)
+        raise HTTPException(500, f"OCR failed: {e}")
+
+
+# --- Format endpoints (ALL must come BEFORE /{page_num}) ---
+
+class _FormatRequest(BaseModel):
+    code_model: str | None = None
+    prompt_id: int | None = None
+
+
+@app.post("/api/format/{doc_id}/all")
+async def format_all_pages(doc_id: str, req: _FormatRequest):
+    with get_db() as conn:
+        doc_row = conn.execute(
+            "SELECT * FROM documents WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+        if doc_row is None:
+            raise HTTPException(404, "Document not found")
+        pages = conn.execute(
+            "SELECT * FROM pages WHERE doc_id=? ORDER BY num", (doc_id,)
+        ).fetchall()
+        fmt_prompt_template = _get_prompt(conn, req.prompt_id, DEFAULT_FORMAT_PROMPT)
+
+    code_model = req.code_model or CODE_MODEL
+    results = []
+
+    for page in pages:
+        if not page["ocr_text"]:
+            results.append({"page_num": page["num"], "skipped": True, "reason": "no_ocr_text"})
+            continue
+        try:
+            full_prompt = fmt_prompt_template
+            
+            # Ensure the ocr_text is injected
+            if "{ocr_text}" in full_prompt:
+                full_prompt = full_prompt.replace("{ocr_text}", page["ocr_text"])
+            else:
+                full_prompt = full_prompt.strip() + "\n\n【必须进行处理的原始内容】\n" + page["ocr_text"]
+                
+            sys_msg = "你是一个无情的LaTeX转化引擎。严格执行转换规则，并且必须处理用户提供的【全部】内容。拒绝任何废话，绝不要输出'好的'或'请提供'等自然语言！直接且只输出LaTeX代码即可！"
+            logger.info(f"Formatting page {page['num']} with text length: {len(page['ocr_text'])}")
+            
+            t0 = time.time()
+            resp = await _http_client.post(
+                f"{OLLAMA_BASE}/api/chat",
+                json={"model": code_model, "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": full_prompt}
+                ], "stream": False},
+            )
+            resp.raise_for_status()
+            fmt_text = resp.json().get("message", {}).get("content", "")
+            elapsed = round(time.time() - t0, 2)
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE pages SET formatted_text=?, format_time=?, prompt_id=? WHERE doc_id=? AND num=?",
+                    (fmt_text, elapsed, req.prompt_id, doc_id, page["num"]),
+                )
+            results.append({"page_num": page["num"], "formatted_text": fmt_text, "format_time": elapsed})
+        except Exception as e:
+            logger.error(f"[Format] Page {page['num']} error: {e}", exc_info=True)
+            results.append({"page_num": page["num"], "error": str(e)})
+
+    return {"doc_id": doc_id, "results": results}
+
+
+@app.post("/api/format/{doc_id}/{page_num}")
+async def format_single_page(doc_id: str, page_num: int, req: _FormatRequest):
+    with get_db() as conn:
+        page = conn.execute(
+            "SELECT * FROM pages WHERE doc_id=? AND num=?", (doc_id, page_num)
+        ).fetchone()
+        fmt_prompt_template = _get_prompt(conn, req.prompt_id, DEFAULT_FORMAT_PROMPT)
+
+    if page is None:
+        raise HTTPException(404, f"Page {page_num} not found")
+        
+    if not page["ocr_text"]:
+        raise HTTPException(400, "Page has no OCR text to format")
+
+    code_model = req.code_model or CODE_MODEL
+    full_prompt = fmt_prompt_template
+    
+    if "{ocr_text}" in full_prompt:
+        full_prompt = full_prompt.replace("{ocr_text}", page["ocr_text"])
+    else:
+        full_prompt = full_prompt.strip() + "\n\n【必须进行处理的原始内容】\n" + page["ocr_text"]
+
+    sys_msg = "你是一个无情的LaTeX转化引擎。严格执行转换规则，并且必须处理用户提供的【全部】内容。拒绝任何废话，绝不要输出'好的'或'请提供'等自然语言！直接且只输出LaTeX代码即可！"
+    logger.info(f"Formatting page {page_num} with text length: {len(page['ocr_text'])}")
+
+    try:
+        t0 = time.time()
+        resp = await _http_client.post(
+            f"{OLLAMA_BASE}/api/chat",
+            json={"model": code_model, "messages": [
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": full_prompt}
+            ], "stream": False},
+        )
+        resp.raise_for_status()
+        fmt_text = resp.json().get("message", {}).get("content", "")
+        elapsed = round(time.time() - t0, 2)
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE pages SET formatted_text=?, format_time=?, prompt_id=? WHERE doc_id=? AND num=?",
+                (fmt_text, elapsed, req.prompt_id, doc_id, page_num),
+            )
+
+        return {
+            "doc_id": doc_id, "page_num": page_num,
+            "formatted_text": fmt_text, "format_time": elapsed,
+        }
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(500, f"Format failed: {e.response.text}")
+    except Exception as e:
+        logger.error(f"[Format] Error: {e}", exc_info=True)
+        raise HTTPException(500, f"Format failed: {e}")
+
+
+# --- Export .tex ---
+
+@app.post("/api/export-tex/{doc_id}")
+async def export_tex(doc_id: str):
+    with get_db() as conn:
+        doc_meta = conn.execute(
+            "SELECT * FROM documents WHERE doc_id=?", (doc_id,)
+        ).fetchone()
+        if doc_meta is None:
+            raise HTTPException(404, "Document not found")
+        pages = conn.execute(
+            "SELECT * FROM pages WHERE doc_id=? ORDER BY num", (doc_id,)
+        ).fetchall()
+
+    parts = []
+    for p in pages:
+        text = p["formatted_text"] or p["ocr_text"] or ""
+        if len(pages) > 1:
+            parts.append(f"% === Page {p['num']} ===\n{text}")
+        else:
+            parts.append(text)
+    content = "\n\n".join(parts)
+
+    safe_name = (doc_meta["filename"] or "document").rsplit(".", 1)[0] + ".tex"
+    encoded_name = quote(safe_name)
+
+    return StreamingResponse(
+        iter([content.encode("utf-8")]),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
+    )
+
+
+# --- Document CRUD ---
 
 @app.delete("/api/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    """Delete a document and its images"""
     with get_db() as conn:
         row = conn.execute("SELECT doc_id FROM documents WHERE doc_id=?", (doc_id,)).fetchone()
         if row is None:
             raise HTTPException(404, "Document not found")
         conn.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,))
-
     doc_dir = _safe_doc_path(doc_id)
     if doc_dir.exists():
         shutil.rmtree(doc_dir, ignore_errors=True)
-
     logger.info(f"[delete] Document {doc_id} removed")
     return {"success": True}
 
-
-# --- Save / List / Get endpoints ---
 
 class _SaveTextRequest(BaseModel):
     text: str
@@ -1163,10 +764,11 @@ class _SaveTextRequest(BaseModel):
 
 @app.put("/api/pages/{doc_id}/{page_num}/text")
 async def save_page_text(doc_id: str, page_num: int, req: _SaveTextRequest):
-    """Save user-edited text for a page."""
     with get_db() as conn:
+        # User explicitly edits textarea -> always update ocr_text to be the new base truth
+        # Also clear the formatted_text so it gets evaluated correctly.
         cur = conn.execute(
-            "UPDATE pages SET ocr_text=? WHERE doc_id=? AND num=?",
+            "UPDATE pages SET ocr_text=?, formatted_text=NULL, format_time=NULL WHERE doc_id=? AND num=?",
             (req.text, doc_id, page_num),
         )
         if cur.rowcount == 0:
@@ -1176,32 +778,22 @@ async def save_page_text(doc_id: str, page_num: int, req: _SaveTextRequest):
 
 @app.get("/api/documents")
 async def list_documents():
-    """List all documents with page counts."""
     with get_db() as conn:
         rows = conn.execute("""
             SELECT d.doc_id, d.filename, d.created_at,
                    COUNT(p.num) AS page_count,
-                   SUM(CASE WHEN p.ocr_text IS NOT NULL THEN 1 ELSE 0 END) AS ocr_count
+                   SUM(CASE WHEN p.ocr_text IS NOT NULL THEN 1 ELSE 0 END) AS ocr_count,
+                   SUM(CASE WHEN p.formatted_text IS NOT NULL THEN 1 ELSE 0 END) AS fmt_count
             FROM documents d
             LEFT JOIN pages p ON d.doc_id = p.doc_id
             GROUP BY d.doc_id
             ORDER BY d.created_at DESC
         """).fetchall()
-    return [
-        {
-            "doc_id": r["doc_id"],
-            "filename": r["filename"],
-            "created_at": r["created_at"],
-            "page_count": r["page_count"],
-            "ocr_count": r["ocr_count"],
-        }
-        for r in rows
-    ]
+    return [dict(r) for r in rows]
 
 
 @app.get("/api/documents/{doc_id}")
 async def get_document(doc_id: str):
-    """Load a document with all its pages (for restore)."""
     with get_db() as conn:
         doc_row = conn.execute(
             "SELECT * FROM documents WHERE doc_id=?", (doc_id,)
@@ -1211,269 +803,16 @@ async def get_document(doc_id: str):
         pages = conn.execute(
             "SELECT * FROM pages WHERE doc_id=? ORDER BY num", (doc_id,)
         ).fetchall()
-
     return {
         "doc_id": doc_row["doc_id"],
         "filename": doc_row["filename"],
         "created_at": doc_row["created_at"],
-        "pages": [
-            {
-                "num": p["num"],
-                "filename": p["filename"],
-                "image_url": f"/api/images/{doc_id}/{p['filename']}",
-                "ocr_text": p["ocr_text"],
-                "ocr_regions": json.loads(p["ocr_regions"]) if p["ocr_regions"] else None,
-                "ocr_time": p["ocr_time"],
-            }
-            for p in pages
-        ],
+        "pages": [_page_info(doc_id, p["num"], p["filename"], p) for p in pages],
     }
 
 
-# --- DOCX Export ---
-
-class _ExportPage(BaseModel):
-    num: int
-    text: str
-
-class _ExportRequest(BaseModel):
-    pages: list[_ExportPage]
-    title: str | None = None
-
-
-class _TableParser(HTMLParser):
-    """Extract rows/cells from an HTML <table>."""
-    def __init__(self):
-        super().__init__()
-        self.rows: list[list[str]] = []
-        self._in_cell = False
-        self._cell_text = ""
-        self._current_row: list[str] = []
-        self._is_header_row = False
-        self.header_row_indices: set[int] = set()
-
-    def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
-        if tag == "tr":
-            self._current_row = []
-            self._is_header_row = False
-        elif tag in ("td", "th"):
-            self._in_cell = True
-            self._cell_text = ""
-            if tag == "th":
-                self._is_header_row = True
-
-    def handle_endtag(self, tag):
-        tag = tag.lower()
-        if tag in ("td", "th"):
-            self._in_cell = False
-            self._current_row.append(self._cell_text.strip())
-        elif tag == "tr":
-            if self._current_row:
-                if self._is_header_row:
-                    self.header_row_indices.add(len(self.rows))
-                self.rows.append(self._current_row)
-
-    def handle_data(self, data):
-        if self._in_cell:
-            self._cell_text += data
-
-
-def _parse_md_table(lines: list[str]) -> list[list[str]]:
-    """Parse markdown table lines into rows of cells."""
-    rows = []
-    for line in lines:
-        stripped = line.strip()
-        cells = [c.strip() for c in stripped.strip("|").split("|")]
-        # Skip separator row (---, :--:, etc.)
-        if all(re.match(r'^[-:]+$', c) for c in cells if c):
-            continue
-        rows.append(cells)
-    return rows
-
-
-def _parse_ocr_text(text: str) -> list[dict]:
-    """Parse OCR text into structured elements: headings, paragraphs, tables.
-    Returns list of {type: 'heading'|'paragraph'|'table', ...}
-    """
-    elements = []
-
-    # Split by HTML tables first
-    parts = re.split(r'(<table[\s\S]*?</table>)', text, flags=re.IGNORECASE)
-
-    for part in parts:
-        if re.match(r'^<table[\s\S]*</table>$', part, re.IGNORECASE):
-            # HTML table
-            parser = _TableParser()
-            parser.feed(part)
-            if parser.rows:
-                elements.append({
-                    "type": "table",
-                    "rows": parser.rows,
-                    "header_rows": parser.header_row_indices,
-                })
-            continue
-
-        # Process non-table text line by line
-        lines = part.split('\n')
-        md_table_buf = []
-
-        def flush_md_table():
-            if not md_table_buf:
-                return
-            rows = _parse_md_table(md_table_buf)
-            if rows:
-                elements.append({
-                    "type": "table",
-                    "rows": rows,
-                    "header_rows": {0},  # first row is header in md tables
-                })
-            md_table_buf.clear()
-
-        for line in lines:
-            trimmed = line.strip()
-
-            # Detect markdown table rows
-            if '|' in trimmed and (trimmed.startswith('|') or re.search(r'\w\s*\|', trimmed)):
-                md_table_buf.append(trimmed)
-                continue
-
-            if md_table_buf:
-                flush_md_table()
-
-            # Headings
-            if trimmed.startswith('### '):
-                elements.append({"type": "heading", "level": 3, "text": trimmed[4:]})
-            elif trimmed.startswith('## '):
-                elements.append({"type": "heading", "level": 2, "text": trimmed[3:]})
-            elif trimmed.startswith('# '):
-                elements.append({"type": "heading", "level": 1, "text": trimmed[2:]})
-            elif trimmed:
-                elements.append({"type": "paragraph", "text": trimmed})
-            # Skip blank lines (they're just spacing)
-
-        flush_md_table()
-
-    return elements
-
-
-def _build_docx(title: str, pages: list[_ExportPage]) -> io.BytesIO:
-    """Build a real DOCX file from parsed OCR text."""
-    doc = DocxDocument()
-
-    # Set default font
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Calibri'
-    font.size = Pt(11)
-    # Set East Asian font (微软雅黑) for Chinese text
-    rpr = style.element.get_or_add_rPr()
-    ea_font = rpr.makeelement(qn('w:rFonts'), {qn('w:eastAsia'): '微软雅黑'})
-    rpr.append(ea_font)
-
-    multi_page = len(pages) > 1
-
-    if multi_page:
-        doc.add_heading(title, level=0)
-
-    for idx, page in enumerate(pages):
-        # Section break for each page after the first (each OCR page = one Word section)
-        if multi_page and idx > 0:
-            doc.add_section(WD_SECTION_START.NEW_PAGE)
-
-        elements = _parse_ocr_text(page.text or '')
-
-        for elem in elements:
-            if elem["type"] == "heading":
-                doc.add_heading(elem["text"], level=elem["level"])
-
-            elif elem["type"] == "paragraph":
-                para = doc.add_paragraph()
-                text = elem["text"]
-                # Simple bold/italic parsing
-                parts = re.split(r'(\*\*.*?\*\*|\*.*?\*)', text)
-                for p in parts:
-                    if p.startswith('**') and p.endswith('**'):
-                        run = para.add_run(p[2:-2])
-                        run.bold = True
-                    elif p.startswith('*') and p.endswith('*') and len(p) > 2:
-                        run = para.add_run(p[1:-1])
-                        run.italic = True
-                    else:
-                        para.add_run(p)
-
-            elif elem["type"] == "table":
-                rows = elem["rows"]
-                if not rows:
-                    continue
-                n_cols = max(len(r) for r in rows)
-                tbl = doc.add_table(rows=len(rows), cols=n_cols)
-                tbl.style = 'Table Grid'
-
-                header_rows = elem.get("header_rows", set())
-
-                for i, row_data in enumerate(rows):
-                    row = tbl.rows[i]
-                    for j, cell_text in enumerate(row_data):
-                        if j < n_cols:
-                            cell = row.cells[j]
-                            cell.text = cell_text
-                            # Bold header cells
-                            if i in header_rows:
-                                for para in cell.paragraphs:
-                                    for run in para.runs:
-                                        run.bold = True
-
-    # Add page number footers (one per section = one per OCR page)
-    if multi_page:
-        for idx, section in enumerate(doc.sections):
-            footer = section.footer
-            footer.is_linked_to_previous = False
-            para = footer.paragraphs[0]
-            para.text = f"— {pages[idx].num} —"
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            for run in para.runs:
-                run.font.size = Pt(9)
-                run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
-
-
-@app.post("/api/export/{doc_id}")
-async def export_docx(doc_id: str, req: _ExportRequest):
-    """Export document as a real DOCX file."""
-    with get_db() as conn:
-        doc_meta = conn.execute(
-            "SELECT * FROM documents WHERE doc_id=?", (doc_id,)
-        ).fetchone()
-    if doc_meta is None:
-        raise HTTPException(404, "Document not found")
-
-    fallback = (doc_meta["filename"] or "Document").replace(".pdf", "")
-    title = req.title or fallback
-
-    buf = _build_docx(title, req.pages)
-
-    # RFC 5987 encoding for non-ASCII filenames
-    safe_name = f"{title}.docx"
-    encoded_name = quote(safe_name)
-
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"
-        },
-    )
-
-
-# Static files — must be last so it doesn't shadow API routes
-# Serves any file in the project root (style.css, script.js, etc.)
+# Static files — must be last
 app.mount("/", StaticFiles(directory="."), name="static")
-
 
 if __name__ == "__main__":
     import uvicorn
